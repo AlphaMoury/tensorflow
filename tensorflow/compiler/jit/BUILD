@@ -21,6 +21,7 @@ load("//tensorflow/core/platform:build_config_root.bzl", "tf_cuda_tests_tags")
 package(
     default_visibility = [
         ":internal",
+        "//learning/tfx/pipeline/infra_validation:__pkg__",
         "//third_party/cloud_tpu/inference_converter:__pkg__",
     ],
     licenses = ["notice"],
@@ -268,10 +269,12 @@ XLA_DEVICE_DEPS = [
     "//tensorflow/core/kernels:resource_variable_ops",
     "//tensorflow/core/kernels:shape_ops",
     "//tensorflow/core/kernels:variable_ops",
+    "//tensorflow/core/kernels/data:finalize_dataset_op",
     "//tensorflow/core/kernels/data:generator_dataset_op",
     "//tensorflow/core/kernels/data:iterator_ops",
     "//tensorflow/core/kernels/data:optional_ops",
     "//tensorflow/core/kernels/data:prefetch_dataset_op",
+    "//tensorflow/core/kernels/data:options_dataset_op",
     "//tensorflow/core/profiler/lib:traceme",
     "//tensorflow/stream_executor:tf_allocator_adapter",
     "//tensorflow/stream_executor/platform",
@@ -379,7 +382,10 @@ cc_library(
     hdrs = [
         "defs.h",
     ],
-    visibility = [":friends"],
+    visibility = [
+        ":friends",
+        "//learning/tfx/pipeline/infra_validation:__pkg__",
+    ],
 )
 
 # Internal targets below this point.

@@ -30,6 +30,7 @@ limitations under the License.
 #include "tensorflow/lite/allocation.h"
 #include "tensorflow/lite/arena_planner.h"
 #include "tensorflow/lite/builtin_ops.h"
+#include "tensorflow/lite/c/c_api_types.h"
 #include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/context_util.h"
 #include "tensorflow/lite/core/api/error_reporter.h"
@@ -153,17 +154,6 @@ const char* GetTFLiteOpName(const TfLiteRegistration& op_reg) {
     return op_reg.custom_name;
   }
   return tflite::EnumNamesBuiltinOperator()[op_reg.builtin_code];
-}
-
-TfLiteStatus ValidateCustomAllocationForTensor(
-    TfLiteContext* context, const TfLiteTensor* tensor,
-    const TfLiteCustomAllocation& allocation) {
-  TF_LITE_ENSURE(context, allocation.data != nullptr);
-  TF_LITE_ENSURE(context, allocation.bytes >= tensor->bytes);
-  // Ensure provided memory is aligned to what TFLite requires.
-  const intptr_t data_ptr_value = reinterpret_cast<intptr_t>(allocation.data);
-  TF_LITE_ENSURE(context, data_ptr_value % kDefaultTensorAlignment == 0);
-  return kTfLiteOk;
 }
 
 }  // namespace
@@ -388,7 +378,7 @@ TfLiteStatus Subgraph::ReplaceNodeSubsetsWithDelegateKernels(
   PartitionGraphIntoIndependentNodeSubsets(&info, nodes_to_replace,
                                            &node_subsets);
 
-  TFLITE_LOG(
+  TFLITE_LOG_PROD(
       tflite::TFLITE_LOG_INFO,
       "Replacing %d node(s) with delegate (%s) node, yielding %zu partitions.",
       nodes_to_replace->size,
@@ -797,12 +787,44 @@ TfLiteStatus Subgraph::AddNodeWithParameters(
     node.custom_initial_data = nullptr;
     node.custom_initial_data_size = 0;
   }
+  node.might_have_side_effect = OpMightHaveSideEffect(&node, registration);
 
   node.delegate = nullptr;
   // Copying of registration is required to support unresolved custom ops.
   node_and_reg.second = *registration;
   execution_plan_.push_back(new_node_index);
   return kTfLiteOk;
+}
+
+namespace {
+// Returns true if any tensor identified by indexes in 'tensor_indexes' is
+// of type 'kTfLiteResource'. False otherwise.
+bool AnyTensorOfTypeResource(const std::vector<TfLiteTensor>& tensors,
+                             const TfLiteIntArray* tensor_indexes) {
+  for (int i = 0; i < tensor_indexes->size; ++i) {
+    int tensor_index = tensor_indexes->data[i];
+    if (tensor_index >= 0 && tensor_index < tensors.size() &&
+        tensors[tensor_index].type == kTfLiteResource)
+      return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+bool Subgraph::OpMightHaveSideEffect(
+    const TfLiteNode* node, const TfLiteRegistration* registration) const {
+  // Check if any of the input tensors are of type resource.
+  if (AnyTensorOfTypeResource(tensors_, node->inputs)) return true;
+  // Check if any of the output tensors are of type resource.
+  if (AnyTensorOfTypeResource(tensors_, node->outputs)) return true;
+  // Consider control flow ops has side effect, some ops in the control flow
+  // subgraph can have side effect.
+  if (registration->builtin_code == kTfLiteBuiltinIf ||
+      registration->builtin_code == kTfLiteBuiltinWhile ||
+      registration->builtin_code == kTfLiteBuiltinCallOnce)
+    return true;
+  return false;
 }
 
 TfLiteStatus Subgraph::ResizeInputTensor(int tensor_index,
@@ -935,7 +957,7 @@ TfLiteStatus Subgraph::PrepareOpsAndTensors() {
   if (!memory_planner_) {
     memory_planner_.reset(new ArenaPlanner(
         &context_, std::unique_ptr<GraphInfo>(new InterpreterInfo(this)),
-        /*preserve_inputs=*/true, /*preserve_intermediates*/ false,
+        /*preserve_inputs=*/true, preserve_all_tensors_,
         kDefaultTensorAlignment));
     memory_planner_->PlanAllocations();
   }
@@ -974,7 +996,7 @@ TfLiteStatus Subgraph::PrepareOpsAndTensors() {
       next_execution_plan_index_to_plan_allocation_,
       last_exec_plan_index_prepared));
 
-  // Ensure custom allocations are still valid for applicable tensors.
+  // Ensure custom allocations are large enough for applicable tensors.
   // This causes some extra validations for cases with dynamic tensors, but the
   // overhead should be minimal since the number of custom-allocated tensors
   // will typically be low.
@@ -982,10 +1004,13 @@ TfLiteStatus Subgraph::PrepareOpsAndTensors() {
     auto index_and_alloc = custom_allocations_[i];
     TfLiteTensor* tensor_at_index = tensor(index_and_alloc.first);
     const auto& alloc = index_and_alloc.second;
-    TF_LITE_ENSURE(context(),
-                   tensor_at_index->allocation_type == kTfLiteCustom);
-    TF_LITE_ENSURE_STATUS(
-        ValidateCustomAllocationForTensor(context(), tensor_at_index, alloc));
+    TF_LITE_ENSURE_EQ(context(), tensor_at_index->allocation_type,
+                      kTfLiteCustom);
+    if (alloc.bytes < tensor_at_index->bytes) {
+      ReportError("Custom allocation is too small for tensor idx: %d",
+                  index_and_alloc.first);
+      return kTfLiteError;
+    }
   }
 
   next_execution_plan_index_to_plan_allocation_ =
@@ -1592,14 +1617,19 @@ TfLiteStatus Subgraph::ModifyGraphWithDelegate(TfLiteDelegate* delegate) {
 }
 
 TfLiteStatus Subgraph::SetCustomAllocationForTensor(
-    int tensor_index, const TfLiteCustomAllocation& allocation) {
+    int tensor_index, const TfLiteCustomAllocation& allocation, int64_t flags) {
   TfLiteTensor* tensor = &context_.tensors[tensor_index];
   TF_LITE_ENSURE(context(),
                  (tensor->allocation_type == kTfLiteArenaRw ||
                   tensor->allocation_type == kTfLiteArenaRwPersistent ||
                   tensor->allocation_type == kTfLiteCustom));
-  TF_LITE_ENSURE_STATUS(
-      ValidateCustomAllocationForTensor(context(), tensor, allocation));
+  // Don't check allocation.bytes here, we do that after all ops are prepared
+  // to allow tensor shape propagation.
+  TF_LITE_ENSURE(context(), allocation.data != nullptr);
+  if (!(flags & kTfLiteCustomAllocationFlagsSkipAlignCheck)) {
+    const intptr_t data_ptr_value = reinterpret_cast<intptr_t>(allocation.data);
+    TF_LITE_ENSURE(context(), data_ptr_value % kDefaultTensorAlignment == 0);
+  }
 
   // If tensor already has a custom alloc, just reassign.
   const auto alloc_it = std::find_if(
@@ -1611,6 +1641,7 @@ TfLiteStatus Subgraph::SetCustomAllocationForTensor(
   if (alloc_it == custom_allocations_.end()) {
     custom_allocations_.emplace_back(tensor_index, allocation);
   } else {
+    // If tensor already has a custom alloc, just reassign.
     alloc_it->second = allocation;
   }
 
@@ -1629,5 +1660,15 @@ void Subgraph::SetName(const char* name) {
 }
 
 const std::string& Subgraph::GetName() const { return name_; }
+
+TfLiteStatus Subgraph::PreserveAllTensorsExperimental() {
+  if (memory_planner_) {
+    ReportError(
+        "PreserveAllTensorsExperimental called after memory was planned. ");
+    return kTfLiteError;
+  }
+  preserve_all_tensors_ = true;
+  return kTfLiteOk;
+}
 
 }  // namespace tflite
